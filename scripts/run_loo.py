@@ -27,7 +27,7 @@ from rich.console import Console
 from rich.table import Table
 
 from src.data_loader import load_task, load_all_tasks
-from src.hypothesis_agent import build_prompt
+from src.hypothesis_agent import build_prompt, build_chain
 from src.leave_one_out import run_task_loo
 from src.evaluate import evaluate_batch
 
@@ -109,6 +109,7 @@ async def run(args) -> None:
     console.print(f"\n[bold]Running LOO on {len(tasks)} task(s) with model={args.model}[/bold]\n")
 
     llm = ChatOpenAI(model=args.model, temperature=0)
+    chain = build_chain(llm)
     all_results = []
 
     for task_id, task in tasks.items():
@@ -117,7 +118,7 @@ async def run(args) -> None:
             f"({len(task.train)} train, {len(task.test)} test)..."
         )
         try:
-            result = await run_task_loo(task, llm=llm, model=args.model)
+            result = await run_task_loo(task, chain=chain, model=args.model)
         except Exception as e:
             console.print(f"  [red]ERROR on {task_id}: {e}[/red]")
             continue

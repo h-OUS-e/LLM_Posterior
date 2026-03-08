@@ -1,9 +1,11 @@
 """Tests for leave_one_out orchestration."""
 import pytest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 from src.data_loader import IOPair, Task
 from src.hypothesis_agent import HypothesisOutput
 from src.leave_one_out import HypothesisResult, TaskResult, run_task_loo
+from src.synthesize_agent import MasterOutput
+from src.generator_agent import GeneratorResult
 
 
 TASK = Task(
@@ -34,12 +36,26 @@ BAD_HYPOTHESIS = HypothesisOutput(
     confidence=0.1,
 )
 
+MASTER_FALLBACK = MasterOutput(
+    agreements="",
+    disagreements="",
+    key_insight="",
+    unified_hypothesis="",
+    train_predictions=[],
+)
+
+GEN_FALLBACK = GeneratorResult(step_by_step_trace="", predicted_output=[])
+
 
 async def test_run_task_loo_returns_task_result():
-    async def mock_generate(demo_pairs, test_input, llm=None, model="gpt-4o"):
+    async def mock_generate(demo_pairs, test_input, chain=None, model="gpt-4o"):
         return GOOD_HYPOTHESIS
 
-    with patch("src.leave_one_out.generate_hypothesis", mock_generate):
+    mock_synth = AsyncMock(return_value=MASTER_FALLBACK)
+    mock_gen = AsyncMock(return_value=GEN_FALLBACK)
+    with patch("src.leave_one_out.generate_hypothesis", mock_generate), \
+         patch("src.leave_one_out.synthesize_hypotheses", mock_synth), \
+         patch("src.leave_one_out.generate_from_hypothesis", mock_gen):
         result = await run_task_loo(TASK)
 
     assert isinstance(result, TaskResult)
@@ -49,10 +65,14 @@ async def test_run_task_loo_returns_task_result():
 
 
 async def test_loo_results_have_correct_held_out_index():
-    async def mock_generate(demo_pairs, test_input, llm=None, model="gpt-4o"):
+    async def mock_generate(demo_pairs, test_input, chain=None, model="gpt-4o"):
         return GOOD_HYPOTHESIS
 
-    with patch("src.leave_one_out.generate_hypothesis", mock_generate):
+    mock_synth = AsyncMock(return_value=MASTER_FALLBACK)
+    mock_gen = AsyncMock(return_value=GEN_FALLBACK)
+    with patch("src.leave_one_out.generate_hypothesis", mock_generate), \
+         patch("src.leave_one_out.synthesize_hypotheses", mock_synth), \
+         patch("src.leave_one_out.generate_from_hypothesis", mock_gen):
         result = await run_task_loo(TASK)
 
     held_out_indices = [r.held_out_index for r in result.loo_results]
@@ -60,10 +80,14 @@ async def test_loo_results_have_correct_held_out_index():
 
 
 async def test_test_results_have_is_test_true():
-    async def mock_generate(demo_pairs, test_input, llm=None, model="gpt-4o"):
+    async def mock_generate(demo_pairs, test_input, chain=None, model="gpt-4o"):
         return GOOD_HYPOTHESIS
 
-    with patch("src.leave_one_out.generate_hypothesis", mock_generate):
+    mock_synth = AsyncMock(return_value=MASTER_FALLBACK)
+    mock_gen = AsyncMock(return_value=GEN_FALLBACK)
+    with patch("src.leave_one_out.generate_hypothesis", mock_generate), \
+         patch("src.leave_one_out.synthesize_hypotheses", mock_synth), \
+         patch("src.leave_one_out.generate_from_hypothesis", mock_gen):
         result = await run_task_loo(TASK)
 
     assert all(r.is_test for r in result.test_results)
@@ -73,7 +97,7 @@ async def test_test_results_have_is_test_true():
 async def test_loo_accuracy_calculation():
     call_count = 0
 
-    async def mock_generate(demo_pairs, test_input, llm=None, model="gpt-4o"):
+    async def mock_generate(demo_pairs, test_input, chain=None, model="gpt-4o"):
         nonlocal call_count
         call_count += 1
         # First LOO call: GOOD → [[1,0]] matches train[0].output [[1,0]]
@@ -82,7 +106,67 @@ async def test_loo_accuracy_calculation():
             return GOOD_HYPOTHESIS
         return BAD_HYPOTHESIS
 
-    with patch("src.leave_one_out.generate_hypothesis", mock_generate):
+    mock_refine = AsyncMock(return_value=BAD_HYPOTHESIS)
+    mock_synth = AsyncMock(return_value=MASTER_FALLBACK)
+    mock_gen = AsyncMock(return_value=GEN_FALLBACK)
+    with patch("src.leave_one_out.generate_hypothesis", mock_generate), \
+         patch("src.leave_one_out.refine_hypothesis", mock_refine), \
+         patch("src.leave_one_out.synthesize_hypotheses", mock_synth), \
+         patch("src.leave_one_out.generate_from_hypothesis", mock_gen):
         result = await run_task_loo(TASK)
 
     assert result.loo_accuracy == pytest.approx(1 / 3)
+
+
+async def test_task_result_has_refined_loo_accuracy():
+    async def mock_generate(demo_pairs, test_input, chain=None, model="gpt-4o"):
+        return GOOD_HYPOTHESIS
+
+    mock_refine = AsyncMock(return_value=BAD_HYPOTHESIS)
+    mock_synth = AsyncMock(return_value=MASTER_FALLBACK)
+    mock_gen = AsyncMock(return_value=GEN_FALLBACK)
+    with patch("src.leave_one_out.generate_hypothesis", mock_generate), \
+         patch("src.leave_one_out.refine_hypothesis", mock_refine), \
+         patch("src.leave_one_out.synthesize_hypotheses", mock_synth), \
+         patch("src.leave_one_out.generate_from_hypothesis", mock_gen):
+        result = await run_task_loo(TASK)
+
+    assert hasattr(result, "refined_loo_accuracy")
+    assert result.refined_loo_accuracy is not None
+
+
+async def test_task_result_has_master_result():
+    async def mock_generate(demo_pairs, test_input, chain=None, model="gpt-4o"):
+        return GOOD_HYPOTHESIS
+
+    mock_synth = AsyncMock(return_value=MASTER_FALLBACK)
+    mock_gen = AsyncMock(return_value=GEN_FALLBACK)
+    with patch("src.leave_one_out.generate_hypothesis", mock_generate), \
+         patch("src.leave_one_out.synthesize_hypotheses", mock_synth), \
+         patch("src.leave_one_out.generate_from_hypothesis", mock_gen):
+        result = await run_task_loo(TASK)
+
+    assert result.master_result is not None
+    assert isinstance(result.master_result, MasterOutput)
+
+
+async def test_task_result_has_generator_results():
+    async def mock_generate(demo_pairs, test_input, chain=None, model="gpt-4o"):
+        return GOOD_HYPOTHESIS
+
+    # Master with non-empty hypothesis so generator branch fires
+    master_with_hyp = MasterOutput(
+        agreements="a", disagreements="d", key_insight="k",
+        unified_hypothesis="invert bits",
+        train_predictions=[],
+    )
+    mock_synth = AsyncMock(return_value=master_with_hyp)
+    mock_gen = AsyncMock(return_value=GEN_FALLBACK)
+    with patch("src.leave_one_out.generate_hypothesis", mock_generate), \
+         patch("src.leave_one_out.synthesize_hypotheses", mock_synth), \
+         patch("src.leave_one_out.generate_from_hypothesis", mock_gen):
+        result = await run_task_loo(TASK)
+
+    assert result.generator_results is not None
+    assert len(result.generator_results) == len(TASK.test)
+    assert isinstance(result.generator_results[0], GeneratorResult)

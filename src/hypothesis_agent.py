@@ -1,13 +1,12 @@
-"""LangChain-based hypothesis generation for ARC-AGI tasks.
+"""LangChain hypothesis generation for ARC-AGI tasks.
 
-Uses a simple prompt chain (no function calling, no tools). The LLM is
-instructed to return raw JSON. On parse failure, retries once, then
-returns a zero-confidence result.
+Uses LCEL chain: ChatPromptTemplate | llm.with_structured_output(HypothesisOutput).
+Retry is handled declaratively via .with_retry(stop_after_attempt=2).
 """
-import json
 import logging
-from typing import Any
 
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
@@ -16,33 +15,30 @@ from src.grid_utils import grid_to_str
 
 logger = logging.getLogger(__name__)
 
-PROMPT_TEMPLATE = """\
-You are solving an ARC-AGI puzzle. You will be shown input/output grid pairs that demonstrate a transformation rule. Grids use integers 0-9 representing colors.
+SYSTEM_PROMPT = """\
+You are solving an ARC-AGI puzzle. You will be shown input/output grid pairs \
+that demonstrate a transformation rule. Grids use integers 0-9 representing colors.
 
+Analyze the demonstration pairs carefully, formulate a clear hypothesis, \
+apply it to the test input, and return your answer as structured JSON.\
+"""
+
+HUMAN_TEMPLATE = """\
 ## Demonstration pairs:
 {demo_pairs}
 
-## Task:
-1. Analyze the demonstration pairs carefully.
-2. Formulate a clear, concise hypothesis describing the transformation rule.
-3. Apply your hypothesis to the following test input.
-4. Return your answer as JSON.
-
 ## Test input:
-{test_input}
-
-Return ONLY valid JSON in this exact format, no markdown fences:
-{{
-  "hypothesis": "description of the transformation rule",
-  "reasoning": "step-by-step reasoning for how you applied the rule",
-  "predicted_output": [[row1], [row2], ...],
-  "confidence": 0.0-1.0
-}}\
+{test_input}\
 """
+
+_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM_PROMPT),
+    ("human", HUMAN_TEMPLATE),
+])
 
 
 class HypothesisOutput(BaseModel):
-    """Parsed LLM response for a single hypothesis generation call."""
+    """Structured LLM response for a single hypothesis generation call."""
 
     hypothesis: str
     reasoning: str
@@ -50,7 +46,7 @@ class HypothesisOutput(BaseModel):
     confidence: float
 
 
-def _format_demo_pairs(demo_pairs: list[IOPair]) -> str:
+def format_demo_pairs(demo_pairs: list[IOPair]) -> str:
     """Format demo pairs as numbered sections for the prompt."""
     sections = []
     for i, pair in enumerate(demo_pairs, 1):
@@ -61,7 +57,7 @@ def _format_demo_pairs(demo_pairs: list[IOPair]) -> str:
 
 
 def build_prompt(demo_pairs: list[IOPair], test_input: list[list[int]]) -> str:
-    """Build the full prompt string for a hypothesis generation call.
+    """Return the formatted human message string (used by dry-run and notebook).
 
     Args:
         demo_pairs: Demonstration input/output pairs.
@@ -70,29 +66,32 @@ def build_prompt(demo_pairs: list[IOPair], test_input: list[list[int]]) -> str:
     Returns:
         Formatted prompt string.
     """
-    return PROMPT_TEMPLATE.format(
-        demo_pairs=_format_demo_pairs(demo_pairs),
+    return HUMAN_TEMPLATE.format(
+        demo_pairs=format_demo_pairs(demo_pairs),
         test_input=grid_to_str(test_input),
     )
 
 
-def _parse_response(content: str) -> HypothesisOutput | None:
-    """Attempt to parse LLM JSON response into HypothesisOutput.
+def build_chain(llm: ChatOpenAI) -> Runnable:
+    """Construct the LCEL hypothesis chain: prompt | structured_llm.
 
-    Returns None on any parse error.
+    Args:
+        llm: Configured ChatOpenAI instance.
+
+    Returns:
+        Runnable that accepts {demo_pairs, test_input} and returns HypothesisOutput.
     """
-    try:
-        data = json.loads(content.strip())
-        return HypothesisOutput(**data)
-    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-        logger.warning("JSON parse failed: %s | content: %.200s", e, content)
-        return None
+    structured_llm = llm.with_structured_output(HypothesisOutput)
+    return (_PROMPT | structured_llm).with_retry(stop_after_attempt=2)
+
+
+_FALLBACK = HypothesisOutput(hypothesis="", reasoning="", predicted_output=[], confidence=0.0)
 
 
 async def generate_hypothesis(
     demo_pairs: list[IOPair],
     test_input: list[list[int]],
-    llm: Any = None,
+    chain: Runnable | None = None,
     model: str = "gpt-4o",
 ) -> HypothesisOutput:
     """Generate a hypothesis for the given demo pairs and test input.
@@ -100,31 +99,21 @@ async def generate_hypothesis(
     Args:
         demo_pairs: Demonstration pairs used as few-shot examples.
         test_input: The grid the model must predict the output for.
-        llm: Optional pre-configured LLM (for testing). If None, creates ChatOpenAI.
-        model: OpenAI model name (used only when llm is None).
+        chain: Optional pre-built LCEL chain (for testing). If None, builds from model name.
+        model: OpenAI model name (used only when chain is None).
 
     Returns:
-        HypothesisOutput. On double failure, returns empty output with confidence=0.
+        HypothesisOutput. On failure after retries, returns empty output with confidence=0.
     """
-    if llm is None:
-        llm = ChatOpenAI(model=model, temperature=0)
+    if chain is None:
+        chain = build_chain(ChatOpenAI(model=model, temperature=0))
 
-    prompt = build_prompt(demo_pairs, test_input)
-
-    for attempt in range(2):
-        try:
-            response = await llm.ainvoke(prompt)
-            result = _parse_response(response.content)
-            if result is not None:
-                return result
-            logger.warning("Parse attempt %d failed, retrying...", attempt + 1)
-        except Exception as e:
-            logger.error("LLM call failed on attempt %d: %s", attempt + 1, e)
-
-    logger.error("Both attempts failed. Returning empty HypothesisOutput.")
-    return HypothesisOutput(
-        hypothesis="",
-        reasoning="",
-        predicted_output=[],
-        confidence=0.0,
-    )
+    try:
+        result = await chain.ainvoke({
+            "demo_pairs": format_demo_pairs(demo_pairs),
+            "test_input": grid_to_str(test_input),
+        })
+        return result
+    except Exception as e:
+        logger.error("Chain failed after retries: %s", e)
+        return _FALLBACK
