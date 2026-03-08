@@ -37,11 +37,10 @@ BAD_HYPOTHESIS = HypothesisOutput(
 )
 
 MASTER_FALLBACK = MasterOutput(
-    agreements="",
-    disagreements="",
-    key_insight="",
+    analyst_gaps="",
+    key_transformations="",
+    reasoning="",
     unified_hypothesis="",
-    train_predictions=[],
 )
 
 GEN_FALLBACK = GeneratorResult(step_by_step_trace="", predicted_output=[])
@@ -156,9 +155,8 @@ async def test_task_result_has_generator_results():
 
     # Master with non-empty hypothesis so generator branch fires
     master_with_hyp = MasterOutput(
-        agreements="a", disagreements="d", key_insight="k",
+        analyst_gaps="a", key_transformations="k", reasoning="r",
         unified_hypothesis="invert bits",
-        train_predictions=[],
     )
     mock_synth = AsyncMock(return_value=master_with_hyp)
     mock_gen = AsyncMock(return_value=GEN_FALLBACK)

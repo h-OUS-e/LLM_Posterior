@@ -146,7 +146,8 @@ async def _run_refinement(
 async def run_task_loo(
     task: Task,
     chain: Runnable | None = None,
-    model: str = "gpt-4o",
+    model: str = "gpt-4.1-mini",
+    compress_analysts: bool = True,
 ) -> TaskResult:
     """Run leave-one-out evaluation for a single task.
 
@@ -173,6 +174,7 @@ async def run_task_loo(
     n = len(task.train)
     loo_raw_list = list(all_raw[:n])   # each is (HypothesisResult, str, list)
     test_results = list(all_raw[n:])   # each is HypothesisResult
+    print(f"[{task.task_id}] LOO+test done ({n} loo, {len(task.test)} test)", flush=True)
 
     loo_results_initial = [item[0] for item in loo_raw_list]
 
@@ -200,6 +202,7 @@ async def run_task_loo(
         refined_results = await asyncio.gather(*refine_coros)
         for idx, refined in zip(refine_indices, refined_results):
             loo_results[idx] = refined
+    print(f"[{task.task_id}] refinement done ({len(refine_coros)} refined)", flush=True)
 
     # refined_loo_accuracy: use refined_exact_match where available, else exact_match
     def _refined_exact(r: HypothesisResult) -> bool:
@@ -211,14 +214,15 @@ async def run_task_loo(
     )
 
     synth_chain = build_synthesis_chain(ChatOpenAI(model=model, temperature=0))
-    master_result = await synthesize_hypotheses(task, loo_results, chain=synth_chain, model=model)
+    master_result = await synthesize_hypotheses(task, loo_results, chain=synth_chain, model=model, compress=compress_analysts)
+    print(f"[{task.task_id}] synthesis done", flush=True)
 
     if master_result.unified_hypothesis and task.test:
         gen_chain = build_generator_chain(ChatOpenAI(model=model, temperature=0))
         gen_coros = [
             generate_from_hypothesis(
                 hypothesis=master_result.unified_hypothesis,
-                key_insight=master_result.key_insight,
+                key_insight=master_result.reasoning,
                 train_pairs=task.train,
                 test_input=pair.input,
                 chain=gen_chain,
@@ -227,6 +231,7 @@ async def run_task_loo(
             for pair in task.test
         ]
         generator_results = list(await asyncio.gather(*gen_coros))
+        print(f"[{task.task_id}] generator done ({len(generator_results)} test outputs)", flush=True)
     else:
         generator_results = None
 
